@@ -10,6 +10,7 @@ from typing import Iterable, Sequence
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
+import random
 
 from PIL import Image, ImageDraw, ImageFont
 
@@ -179,7 +180,39 @@ def generate_samples(out_dir: Path) -> list[Path]:
     im.save(p)
     paths.append(p)
 
-    # 4) "Fingerprint" style
+    # 4) "Photo" style (gradient + noise + shaded shapes)
+    w, h = 640, 420
+    rnd = random.Random(0)
+    buf = bytearray(w * h * 3)
+    for y in range(h):
+        t = y / (h - 1)
+        sky_r = int(70 + 80 * (1 - t))
+        sky_g = int(120 + 90 * (1 - t))
+        sky_b = int(170 + 70 * (1 - t))
+        water_r = int(20 + 30 * t)
+        water_g = int(70 + 60 * t)
+        water_b = int(110 + 80 * t)
+        for x in range(w):
+            base = (y * w + x) * 3
+            if y < h * 0.55:
+                r, g, b = sky_r, sky_g, sky_b
+            else:
+                r, g, b = water_r, water_g, water_b
+            n = rnd.randint(-10, 10)
+            buf[base] = clamp_u8(r + n)
+            buf[base + 1] = clamp_u8(g + n)
+            buf[base + 2] = clamp_u8(b + n)
+    im = Image.frombytes("RGB", (w, h), bytes(buf))
+    d = ImageDraw.Draw(im)
+    d.ellipse((60, 40, 150, 130), fill=(250, 235, 170))
+    d.polygon([(0, 260), (170, 130), (300, 260)], fill=(60, 70, 80))
+    d.polygon([(220, 260), (390, 120), (560, 260)], fill=(50, 60, 70))
+    d.polygon([(420, 260), (560, 160), (640, 260)], fill=(70, 80, 90))
+    p = out_dir / "sample_photo.png"
+    im.save(p)
+    paths.append(p)
+
+    # 5) "Fingerprint" style
     w, h = 420, 420
     im = Image.new("RGB", (w, h), (235, 235, 235))
     d = ImageDraw.Draw(im)
@@ -195,7 +228,7 @@ def generate_samples(out_dir: Path) -> list[Path]:
     im.save(p)
     paths.append(p)
 
-    # 5) Unevenly lit text page
+    # 6) Unevenly lit text page
     w, h = 900, 520
     base = Image.new("RGB", (w, h), (245, 245, 235))
     d = ImageDraw.Draw(base)
@@ -234,9 +267,9 @@ def process_one(
     input_path: Path,
     out_dir: Path,
     weights: GrayWeights,
-    window_size: int,
+    window_sizes: Sequence[int],
     offset: int,
-) -> tuple[Path, Path, Path]:
+) -> tuple[Path, list[Path], Path]:
     rgb = Image.open(input_path)
     gray = to_grayscale(rgb, weights=weights)
 
@@ -244,15 +277,20 @@ def process_one(
     gray_path = out_dir / f"{input_path.stem}_gray.bmp"
     gray.save(gray_path, format="BMP")
 
-    binary = adaptive_threshold_mean(gray, window_size=window_size, offset=offset)
-    bin_path = out_dir / f"{input_path.stem}_bin.bmp"
-    binary.save(bin_path, format="BMP")
+    bin_paths: list[Path] = []
+    bin_images: list[Image.Image] = []
+    for window_size in window_sizes:
+        binary = adaptive_threshold_mean(gray, window_size=window_size, offset=offset)
+        bin_path = out_dir / f"{input_path.stem}_bin_w{window_size}.bmp"
+        binary.save(bin_path, format="BMP")
+        bin_paths.append(bin_path)
+        bin_images.append(binary)
 
-    compare = hstack([rgb.convert("RGB"), gray.convert("RGB"), binary.convert("RGB")])
+    compare = hstack([rgb.convert("RGB"), gray.convert("RGB"), *[b.convert("RGB") for b in bin_images]])
     comp_path = out_dir / f"{input_path.stem}_compare.png"
     compare.save(comp_path, format="PNG")
 
-    return gray_path, bin_path, comp_path
+    return gray_path, bin_paths, comp_path
 
 
 def iter_images(input_dir: Path) -> Iterable[Path]:
@@ -276,13 +314,24 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Download images from slavcorpora (UUID or a URL containing it) into input/ as PNG.",
     )
     ap.add_argument("--limit", type=int, default=3, help="How many images to download (when downloading)")
-    ap.add_argument("--window", type=int, default=5, help="Odd window size for adaptive mean threshold (variant: 5)")
-    ap.add_argument("--offset", type=int, default=5, help="Offset subtracted from local mean (higher -> more white)")
+    ap.add_argument(
+        "--windows",
+        type=str,
+        default="5,15",
+        help="Comma-separated odd window sizes for adaptive mean threshold (variant: 5x5, 15x15).",
+    )
+    ap.add_argument(
+        "--window",
+        type=int,
+        default=None,
+        help="(Deprecated) Single odd window size; overrides --windows when provided.",
+    )
+    ap.add_argument("--offset", type=int, default=0, help="Offset subtracted from local mean (higher -> more white)")
     ap.add_argument("--weights", type=str, default="0.299,0.587,0.114", help="Grayscale weights: r,g,b")
     ap.add_argument(
         "--export-previews",
         action="store_true",
-        help="Also export *_gray.png and *_bin.png for README preview.",
+        help="Also export *_gray.png and *_bin_w{N}.png for README preview.",
     )
     return ap.parse_args(argv)
 
@@ -374,6 +423,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     input_dir: Path = args.input
     output_dir: Path = args.output
 
+    if args.window is not None:
+        window_sizes = [int(args.window)]
+    else:
+        try:
+            window_sizes = [int(x.strip()) for x in str(args.windows).split(",") if x.strip()]
+        except Exception:
+            raise SystemExit("--windows must be like '5,15'")
+    if not window_sizes:
+        raise SystemExit("At least one window size is required")
+    for w in window_sizes:
+        if w < 3 or w % 2 == 0:
+            raise SystemExit(f"Invalid window size {w}; must be odd and >= 3")
+
     try:
         wr, wg, wb = (float(x.strip()) for x in str(args.weights).split(","))
     except Exception:
@@ -401,18 +463,22 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     output_dir.mkdir(parents=True, exist_ok=True)
     for p in images:
-        gray_path, bin_path, comp_path = process_one(
+        gray_path, bin_paths, comp_path = process_one(
             p,
             out_dir=output_dir,
             weights=weights,
-            window_size=args.window,
+            window_sizes=window_sizes,
             offset=args.offset,
         )
-        print(f"{p.name} -> {os.fspath(gray_path)}, {os.fspath(bin_path)}, {os.fspath(comp_path)}")
+        print(
+            f"{p.name} -> {os.fspath(gray_path)}, "
+            f"{', '.join(os.fspath(x) for x in bin_paths)}, {os.fspath(comp_path)}"
+        )
 
         if args.export_previews:
             Image.open(gray_path).convert("RGB").save(output_dir / f"{p.stem}_gray.png", format="PNG")
-            Image.open(bin_path).convert("RGB").save(output_dir / f"{p.stem}_bin.png", format="PNG")
+            for bin_path in bin_paths:
+                Image.open(bin_path).convert("RGB").save(output_dir / f"{bin_path.stem}.png", format="PNG")
 
     return 0
 
